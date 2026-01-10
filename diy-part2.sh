@@ -11,5 +11,5 @@
 # 复制nanopi-t4的patch到patches目录
 cp -f $GITHUB_WORKSPACE/kernel-rockchip/patches/131-nanopi4-dts-update-fix.patch target/linux/rockchip/patches-6.6/
 cp -f $GITHUB_WORKSPACE/kernel-rockchip/patches/109-nanopc-t4-add-led-aliases.patch target/linux/rockchip/patches-6.6/
-cp -f ${GITHUB_WORKSPACE}/patch/T4/fix-CPU-information.patch patch/kernel/archive/rockchip64-6.6/
-cp -f ${GITHUB_WORKSPACE}/patch/T4/t4.patch patch/kernel/archive/rockchip64-6.6/
+# cp -f ${GITHUB_WORKSPACE}/patch/T4/fix-CPU-information.patch patch/kernel/archive/rockchip64-6.1/
+cp -f $GITHUB_WORKSPACE/kernel-rockchip/patches/t4.patch patch/kernel/archive/rockchip64-6.6/
