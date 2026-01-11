@@ -1,1 +1,263 @@
+# GitHub Actions workflow: build iStoreOS (istoreos) for NanoPC-T4 using Zane-E/Armbian-Actions kernel patches.
+# - Clones istoreos (OpenWrt source)
+# - Clones Zane-E/Armbian-Actions (patches)
+# - Prepares a custom kernel tree (tries KERNEL_TAG; fallback tags optional)
+# - Applies patches (git am -> git apply fallback)
+# - Builds OpenWrt using the patched kernel via LINUX_DIR
+#
+# Notes:
+# - Adjust the APT packages list to match your runner capabilities; OpenWrt build can require many packages.
+# - If any repo is private, use a PAT stored in secrets and clone with https://x-access-token:${{ secrets.PAT }}@github.com/...
+# - This workflow intentionally avoids applying Lemon1151/iStoreOS-RK3399 device patches.
+# - Test locally before relying on CI for long runs.
+name: Build iStoreOS (nanopc-t4) with Zane-E patches
+
+on:
+  workflow_dispatch:
+    inputs:
+      REPO_BRANCH:
+        description: 'istoreos repo branch'
+        required: true
+        default: 'istoreos-24.10'
+      KERNEL_TAG:
+        description: 'Preferred linux-stable tag to use as base (try matching patches target).'
+        required: true
+        default: 'v6.19'
+      KERNEL_FALLBACKS:
+        description: 'Comma-separated fallback kernel tags (optional, tried in order)'
+        required: false
+        default: 'v6.18'
+      PATCH_REPO:
+        description: 'Patches repo (Zane-E/Armbian-Actions)'
+        required: true
+        default: 'https://github.com/Zane-E/Armbian-Actions.git'
+      ISTOREOS_REPO:
+        description: 'iStoreOS (openwrt) repo to build'
+        required: true
+        default: 'https://github.com/istoreos/istoreos'
+      ISTOREOS_REPO_BRANCH:
+        description: 'branch of istoreos to clone'
+        required: true
+        default: '${{ inputs.REPO_BRANCH }}'
+      UPLOAD_ARTIFACTS:
+        description: 'Upload build artifacts'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+env:
+  WORKDIR: /mnt/workdir
+  OPENWRT_DIR: /mnt/workdir/openwrt
+  PATCH_REPO_DIR: /mnt/workdir/armbian-actions
+  CUSTOM_KERNEL_DIR: /mnt/workdir/custom-linux
+  PATCH_FAIL_DIR: /mnt/workdir/patch-fails
+  BOARD: nanopc-t4
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 720
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      - name: Prepare environment and install packages
+        run: |
+          sudo apt-get update -y
+          # Minimal list. Add more packages as required by your OpenWrt build.
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential ccache bzip2 python3 git wget subversion libncurses5-dev zlib1g-dev \
+            gawk flex gettext unzip file libssl-dev rsync automake autopoint autoconf bc \
+            cpio python3-distutils python3-pip pkg-config curl libelf-dev libssl-dev \
+            liblz4-tool
+          sudo pip3 install pyelftools
+
+      - name: Prepare workspace
+        run: |
+          sudo mkdir -p ${WORKDIR}
+          sudo chown $USER:$(id -gn) ${WORKDIR}
+          mkdir -p ${PATCH_FAIL_DIR}
+
+      - name: Clone iStoreOS (openwrt) source
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          echo "Cloning istoreos: ${{ inputs.ISTOREOS_REPO }} branch ${{ inputs.ISTOREOS_REPO_BRANCH }}"
+          git clone --depth=1 --branch "${{ inputs.ISTOREOS_REPO_BRANCH }}" "${{ inputs.ISTOREOS_REPO }}" openwrt
+          ls -la openwrt
+
+      - name: Clone patches (Zane-E/Armbian-Actions)
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          echo "Cloning patches repo: ${{ inputs.PATCH_REPO }}"
+          git clone --depth=1 "${{ inputs.PATCH_REPO }}" armbian-actions || (echo "Clone failed" && exit 1)
+          ls -la armbian-actions | sed -n '1,200p'
+
+      - name: Prepare custom kernel and apply patches
+        working-directory: ${{ env.WORKDIR }}
+        env:
+          KERNEL_TAG: ${{ inputs.KERNEL_TAG }}
+          KERNEL_FALLBACKS: ${{ inputs.KERNEL_FALLBACKS }}
+          PATCH_DIR: ${{ env.PATCH_REPO_DIR }}
+        run: |
+          set -euo pipefail
+          echo "Prepare custom kernel at ${CUSTOM_KERNEL_DIR}"
+          rm -rf "${CUSTOM_KERNEL_DIR}" "${PATCH_FAIL_DIR}" || true
+          mkdir -p "${PATCH_FAIL_DIR}"
+
+          # Build list of kernel tags to try
+          TAGS="${KERNEL_TAG}"
+          if [ -n "${KERNEL_FALLBACKS:-}" ]; then
+            TAGS="${TAGS},${KERNEL_FALLBACKS}"
+          fi
+
+          tried_ok=0
+          IFS=',' read -ra TAGARR <<< "$TAGS"
+          for tag in "${TAGARR[@]}"; do
+            tag="$(echo "$tag" | xargs)"   # trim
+            echo "Trying kernel tag: $tag"
+            rm -rf "${CUSTOM_KERNEL_DIR}"
+            if git clone --branch "${tag}" --depth 1 https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git "${CUSTOM_KERNEL_DIR}"; then
+              cd "${CUSTOM_KERNEL_DIR}"
+              git checkout -b istoreos-zane-patched || true
+
+              # Collect patches from armbian-actions/patch (common locations used by the repo)
+              PATCHES=$(find "${PATCH_DIR}" -type f -iname '*.patch' | sort)
+              if [ -z "${PATCHES}" ]; then
+                echo "No patches found in ${PATCH_DIR}; nothing to apply."
+                tried_ok=1
+                break
+              fi
+
+              echo "Applying patches (count: $(echo "$PATCHES" | wc -l)) ..."
+              apply_fail=0
+
+              for p in ${PATCHES}; do
+                echo ">> Applying patch: $p"
+                # First try git am (mbox style)
+                if git am --whitespace=fix "$p" 2> /tmp/git-am.err; then
+                  echo "git am OK: $p"
+                else
+                  echo "git am failed, trying git apply for $p"
+                  cat /tmp/git-am.err >> "${PATCH_FAIL_DIR}/git-am-errors.log" || true
+                  if git apply --index "$p" 2> /tmp/git-apply.err; then
+                    git add -A
+                    git commit -m "Apply patch $(basename "$p") (via git apply)" || true
+                  else
+                    echo "Failed to apply patch $p"
+                    cat /tmp/git-apply.err >> "${PATCH_FAIL_DIR}/git-apply-errors.log" || true
+                    apply_fail=1
+                    break
+                  fi
+                fi
+              done
+
+              if [ $apply_fail -eq 0 ]; then
+                echo "All patches applied successfully on kernel ${tag}."
+                tried_ok=1
+                break
+              else
+                echo "Patches failed on kernel ${tag}; saving kernel tree for debugging."
+                mv "${CUSTOM_KERNEL_DIR}" "${CUSTOM_KERNEL_DIR}-${tag}-failed" || true
+              fi
+            else
+              echo "Failed to clone linux-stable ${tag}"
+            fi
+          done
+
+          if [ $tried_ok -ne 1 ]; then
+            echo "ERROR: Could not apply patches to any kernel tag. Check ${PATCH_FAIL_DIR}."
+            ls -la "${PATCH_FAIL_DIR}" || true
+            exit 1
+          fi
+
+          echo "Patched kernel ready at: ${CUSTOM_KERNEL_DIR}"
+          cd "${CUSTOM_KERNEL_DIR}"
+          echo "Kernel HEAD:"
+          git --no-pager log -1 --pretty=format:"%h %s"
+
+      - name: (Optional) Remove existing iStoreOS rockchip patches to avoid conflicts
+        if: always()
+        working-directory: ${{ env.OPENWRT_DIR }}
+        run: |
+          # If you want to keep iStoreOS provided rockchip patches, remove or comment out this step.
+          if compgen -G "target/linux/rockchip/patches-*" > /dev/null; then
+            echo "Backing up and removing existing target/linux/rockchip/patches-* to avoid conflicts"
+            mkdir -p /mnt/workdir/istoreos-patches-backup
+            mv target/linux/rockchip/patches-* /mnt/workdir/istoreos-patches-backup/ || true
+          else
+            echo "No existing iStoreOS rockchip patches found, skipping removal."
+          fi
+
+      - name: Configure OpenWrt feeds (use default feeds.conf or adjust)
+        working-directory: ${{ env.OPENWRT_DIR }}
+        run: |
+          # If this istoreos fork provides feeds.conf.default in repo root, it's already present.
+          # Update and install feeds.
+          ./scripts/feeds update -a || true
+          ./scripts/feeds install -a || true
+
+      - name: Build OpenWrt (download packages) using custom kernel
+        working-directory: ${{ env.OPENWRT_DIR }}
+        run: |
+          set -euo pipefail
+          # Ensure .config exists or use defconfig. Adjust if istoreos provides a predefined .config.
+          if [ -f "${{ env.OPENWRT_DIR }}/.config" ]; then
+            echo ".config exists, using it"
+          else
+            echo "No .config found, running make defconfig"
+            make defconfig
+          fi
+
+          # Download prerequisites
+          make LINUX_DIR=${{ env.CUSTOM_KERNEL_DIR }} download -j8 || { echo "download failed"; exit 1; }
+
+      - name: Compile OpenWrt / iStoreOS using custom kernel
+        working-directory: ${{ env.OPENWRT_DIR }}
+        env:
+          MAKEFLAGS: -j$(nproc)
+        run: |
+          set -euo pipefail
+          echo "Start build (this can take hours)..."
+          # Try parallel build, fallback to single-thread verbose if failure
+          make LINUX_DIR=${{ env.CUSTOM_KERNEL_DIR }} || make LINUX_DIR=${{ env.CUSTOM_KERNEL_DIR }} V=s -j1
+
+      - name: Collect firmware artifacts
+        if: ${{ inputs.UPLOAD_ARTIFACTS == 'true' }}
+        working-directory: ${{ env.OPENWRT_DIR }}
+        run: |
+          mkdir -p /tmp/istoreos-output
+          if ls bin/targets/*/*/*.img.gz >/dev/null 2>&1; then
+            cp -v bin/targets/*/*/*.img.gz /tmp/istoreos-output/ || true
+          fi
+          if ls bin/targets/*/*/*.bin >/dev/null 2>&1; then
+            cp -v bin/targets/*/*/*.bin /tmp/istoreos-output/ || true
+          fi
+          # also collect kernel dtbs/modules for debug
+          mkdir -p /tmp/istoreos-output/extra
+          cp -v $(pwd)/build_dir/target-*/linux-*/image/*  /tmp/istoreos-output/extra/ 2>/dev/null || true
+          ls -la /tmp/istoreos-output || true
+
+      - name: Upload artifacts
+        if: ${{ inputs.UPLOAD_ARTIFACTS == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: istoreos-nanopc-t4-build
+          path: /tmp/istoreos-output
+
+      - name: Optionally create a Release with artifacts (requires repo write token)
+        if: ${{ inputs.UPLOAD_ARTIFACTS == 'true' }}
+        uses: ncipollo/release-action@v2
+        with:
+          tag: istoreos-nanopc-t4-${{ github.run_number }}
+          name: istoreos-nanopc-t4-${{ github.run_number }}
+          artifacts: /tmp/istoreos-output/*
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            Build of iStoreOS for NanoPC-T4 using Zane-E patches.
+            - Kernel base: ${{ inputs.KERNEL_TAG }} (plus fallbacks: ${{ inputs.KERNEL_FALLBACKS }})
+            - Patches sourced from ${{ inputs.PATCH_REPO }}
 
